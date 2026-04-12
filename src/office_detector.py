@@ -23,11 +23,13 @@ class OfficeClipDetector:
         # Detection thresholds (adjusted for better sensitivity)
         self.looking_down_threshold = 0.5  # Increased from 0.25 to catch your eye position
         self.debounce_threshold = 0.6      # Increased from 0.45
-        self.timer = 2.0  # seconds
+        self.timer = 0.0  # seconds - instant trigger
 
         # State tracking
         self.video_playing = False
         self.start_time = None
+        self.last_clip_time = 0
+        self.clip_cooldown = 15.0  # seconds before next clip can trigger
 
         # Calibration for personalized thresholds
         self.calibration_frames = []
@@ -49,19 +51,19 @@ class OfficeClipDetector:
         # Load phone detection model (simplified COCO-like detection)
         self.setup_phone_detection()
 
-        # Office clips
+        # Load actual Office clip files
+        clips_dir = os.path.join(os.path.dirname(__file__), '..', 'assets', 'office-clips')
         self.office_clips = [
-            "No... god no... NOOOO!",
-            "That's what she said!",
-            "I am running away from my responsibilities. And it feels good.",
-            "I'm not superstitious, but I am a little stitious.",
-            "Bears. Beets. Battlestar Galactica.",
-            "I DECLARE BANKRUPTCY!",
-            "Sometimes I'll start a sentence and I don't even know where it's going.",
-            "I'm not a millionaire. I thought I would be by the time I was 30, but I wasn't even close.",
-            "The worst thing about prison was the... was the Dementors.",
-            "I'm an early bird and I'm a night owl. So I'm wise and I have worms."
+            os.path.join(clips_dir, f)
+            for f in os.listdir(clips_dir)
+            if f.lower().endswith(('.mov', '.mp4', '.avi', '.gif'))
         ]
+        if self.office_clips:
+            print(f"🎬 Loaded {len(self.office_clips)} Office clips:")
+            for clip in self.office_clips:
+                print(f"   • {os.path.basename(clip)}")
+        else:
+            print("⚠️  No clips found in assets/office-clips/")
 
         # Initialize pygame for sound
         pygame.mixer.init()
@@ -243,74 +245,83 @@ class OfficeClipDetector:
         return avg_ratio, l_iris, r_iris, left, right
 
     def detect_looking_down(self, avg_ratio, eye_state, phone_detected):
-        """Multi-modal detection: iris + eye state + phone detection"""
+        """Detection: phone in view OR iris deviated from baseline"""
         if self.is_calibrating:
-            return False, "Calibrating"
-
-        # Don't trigger if eyes are closed (to avoid false positives)
-        if eye_state['eyes_closed']:
-            return False, "Eyes closed"
+            return False, "Calibrating..."
 
         reasons = []
-        detection_score = 0
 
-        # 1. Iris-based detection (original logic)
-        if self.baseline_ratio is None:
-            # Use original threshold if no calibration
-            if avg_ratio < self.looking_down_threshold:
-                detection_score += 3
-                reasons.append(f"Iris down ({avg_ratio:.3f} < {self.looking_down_threshold})")
-        else:
-            # Use calibrated threshold
-            calibrated_threshold = self.baseline_ratio + 0.15
-            if avg_ratio > calibrated_threshold:
-                detection_score += 3
-                reasons.append(f"Iris down vs baseline ({avg_ratio:.3f} > {calibrated_threshold:.3f})")
-
-        # 2. Phone object detection (like doom-slayer)
+        # Signal 1: Phone is visible in frame — strongest signal
         if phone_detected:
-            detection_score += 4
-            reasons.append("Phone detected")
+            reasons.append("Phone in view")
 
-        # 3. Eye state assessment
-        if eye_state['eyes_open'] and eye_state['eye_aspect_ratio'] < 0.3:
-            detection_score += 2
-            reasons.append("Eyes looking down")
+        # Signal 2: Iris ratio deviated DOWN from baseline (looking down = ratio drops)
+        if self.baseline_ratio is not None:
+            deviation = self.baseline_ratio - avg_ratio  # positive = looking down
+            if deviation > 0.04:
+                reasons.append(f"Iris down ({deviation:.3f} below baseline)")
+        else:
+            if avg_ratio < self.looking_down_threshold:
+                reasons.append(f"Iris low ({avg_ratio:.3f})")
 
-        # Multi-modal threshold: need score >= 4 to trigger
-        is_detected = detection_score >= 4
+        # Trigger on ANY signal (phone alone is enough)
+        is_detected = len(reasons) > 0
 
-        return is_detected, " | ".join(reasons) if reasons else "No indicators"
+        return is_detected, " | ".join(reasons) if reasons else "No signal"
 
     def play_office_clip(self):
-        """Play random Office clip with non-blocking text-to-speech"""
-        if self.video_playing:
+        """Play random Office clip in a popup via separate process (macOS thread-safe)"""
+        if self.video_playing or not self.office_clips:
             return
 
         self.video_playing = True
+        clip_path = random.choice(self.office_clips)
+        print(f"🎬 Playing: {os.path.basename(clip_path)}")
 
-        # Random Office clip
-        clip = random.choice(self.office_clips)
-        print(f"🎬 Playing Office clip: '{clip}'")
+        # Popup player script — runs in its own process so cv2 GUI works on macOS
+        popup_script = f"""
+import cv2, subprocess, sys
 
-        # Non-blocking text-to-speech in separate thread
-        def play_audio():
-            try:
-                if os.name == 'nt':  # Windows
-                    subprocess.run(['powershell', '-Command', f'Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{clip}")'],
-                                 check=False, timeout=10)
-                elif os.name == 'posix':  # macOS/Linux
-                    if os.uname().sysname == 'Darwin':  # macOS
-                        subprocess.run(['say', clip], check=False, timeout=10)
-                    else:  # Linux
-                        subprocess.run(['espeak', clip], check=False, timeout=10)
-            except Exception as e:
-                print(f"🔇 Audio failed: {e}")
+clip_path = {repr(clip_path)}
+cap = cv2.VideoCapture(clip_path)
+fps = cap.get(cv2.CAP_PROP_FPS) or 30
+delay = int(1000 / fps)
 
-        # Start audio in background thread
-        audio_thread = threading.Thread(target=play_audio)
-        audio_thread.daemon = True
-        audio_thread.start()
+audio = subprocess.Popen(['afplay', clip_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+cv2.namedWindow('GET BACK TO WORK', cv2.WINDOW_NORMAL)
+cv2.resizeWindow('GET BACK TO WORK', 480, 360)
+cv2.moveWindow('GET BACK TO WORK', 200, 150)
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame = cv2.resize(frame, (480, 360))
+    cv2.rectangle(frame, (0, 0), (480, 55), (0, 0, 180), -1)
+    cv2.putText(frame, 'PUT THE PHONE DOWN!', (15, 38),
+                cv2.FONT_HERSHEY_DUPLEX, 0.95, (255, 255, 255), 2)
+    cv2.imshow('GET BACK TO WORK', frame)
+    if cv2.waitKey(delay) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+audio.terminate()
+"""
+
+        import sys
+
+        def launch():
+            proc = subprocess.Popen(
+                [sys.executable, '-c', popup_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            proc.wait()  # Wait for popup to close
+            self.video_playing = False
+
+        threading.Thread(target=launch, daemon=True).start()
 
     def stop_office_clip(self):
         """Stop the Office clip"""
@@ -320,10 +331,9 @@ class OfficeClipDetector:
         self.video_playing = False
         print("✅ Office clip stopped - back to work!")
 
-        # Stop any ongoing speech
+        # Kill audio
         try:
-            if os.name == 'posix' and os.uname().sysname == 'Darwin':
-                subprocess.run(['pkill', '-f', 'say'], check=False)
+            subprocess.run(['pkill', 'afplay'], check=False)
         except:
             pass
 
@@ -404,16 +414,19 @@ class OfficeClipDetector:
                     # Multi-modal detection
                     is_looking_down, detection_reason = self.detect_looking_down(avg_ratio, eye_state, self.phone_detected)
 
-                    # Timer logic (exact from Skyrim edition)
+                    # Trigger logic
+                    now = time.time()
+                    on_cooldown = (now - self.last_clip_time) < self.clip_cooldown
+
                     if is_looking_down:
                         if self.start_time is None:
-                            self.start_time = time.time()
-                        elif time.time() - self.start_time >= self.timer and not self.video_playing:
+                            self.start_time = now
+                        elif now - self.start_time >= self.timer and not self.video_playing and not on_cooldown:
                             self.play_office_clip()
+                            self.last_clip_time = now
                     else:
                         self.start_time = None
-                        if self.video_playing:
-                            self.stop_office_clip()
+                        self.video_playing = False  # Reset so next detection can trigger
 
                     # Visual feedback (like original)
                     h, w = frame.shape[:2]
@@ -464,8 +477,14 @@ class OfficeClipDetector:
 
             cv2.imshow('Procrastination Police - Office Edition', frame)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('t'):
+                # Manual test: force play a clip
+                print("🧪 Manual test triggered!")
+                self.video_playing = False  # Reset so it can play
+                self.play_office_clip()
 
         cap.release()
         cv2.destroyAllWindows()
