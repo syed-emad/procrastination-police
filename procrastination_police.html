@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procrastination Police - JS Edition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+            font-family: 'Courier New', monospace;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .video-container {
+            position: relative;
+            border: 3px solid #333;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        #videoElement {
+            width: 640px;
+            height: 480px;
+            transform: scaleX(-1); /* Mirror like webcam */
+        }
+
+        .overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .status {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 5px solid #00ff00;
+        }
+
+        .status.alert {
+            border-left-color: #ff0000;
+            background: rgba(255, 0, 0, 0.2);
+        }
+
+        .alert-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(255, 0, 0, 0.9);
+            color: white;
+            padding: 30px;
+            border-radius: 15px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            display: none;
+            border: 3px solid #ff6666;
+            box-shadow: 0 0 20px rgba(255, 0, 0, 0.5);
+        }
+
+        .info-panel {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 10px;
+            width: 640px;
+            font-size: 14px;
+        }
+
+        .calibration-bar {
+            width: 100%;
+            height: 20px;
+            background: #333;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .calibration-progress {
+            height: 100%;
+            background: linear-gradient(90deg, #00ff00, #00aa00);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .controls {
+            margin-top: 20px;
+        }
+
+        button {
+            background: #333;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 0 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: 'Courier New', monospace;
+        }
+
+        button:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚔 Procrastination Police - JS Edition</h1>
+        <p>Using exact doom-slayer detection algorithms</p>
+
+        <div class="video-container">
+            <video id="videoElement" autoplay muted playsinline></video>
+            <div class="overlay">
+                <div id="statusDisplay" class="status">
+                    <div id="statusText">Initializing...</div>
+                    <div id="calibrationStatus"></div>
+                </div>
+                <div id="alertBox" class="alert-box">
+                    📱 STOP LOOKING AT PHONE!<br>
+                    GET BACK TO WORK!
+                </div>
+            </div>
+        </div>
+
+        <div class="info-panel">
+            <h3>📊 Detection Info</h3>
+            <div id="detectionInfo">Starting up...</div>
+            <div id="calibrationBar" class="calibration-bar">
+                <div id="calibrationProgress" class="calibration-progress"></div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button onclick="resetCalibration()">🔄 Reset Calibration</button>
+            <button onclick="toggleSensitivity()">⚙️ Sensitivity: <span id="sensitivityLevel">Medium</span></button>
+            <button onclick="addOfficeClip()">🎬 Add Office Clips</button>
+        </div>
+    </div>
+
+    <script>
+        // Procrastination Police - Based on doom-slayer detection
+        class ProcrastinationDetector {
+            constructor() {
+                // Detection state (from doom-slayer)
+                this.sensitivity = 0.5;
+                this.detectionThreshold = 3; // Consecutive frames needed
+                this.doomscrollCount = 0;
+
+                // Calibration (from doom-slayer)
+                this.calibrationFrames = 30;
+                this.calibrationData = [];
+                this.baseline = null;
+                this.isCalibrated = false;
+
+                // Models
+                this.faceMesh = null;
+                this.cocoModel = null;
+                this.phoneDetected = false;
+
+                // Recent office clips
+                this.officeClips = [
+                    'No... god no... NOOOO!',
+                    'That\'s what she said!',
+                    'I am running away from my responsibilities. And it feels good.',
+                    'I\'m not superstitious, but I am a little stitious.',
+                    'Bears. Beets. Battlestar Galactica.'
+                ];
+
+                this.init();
+            }
+
+            async init() {
+                console.log('🚀 Initializing Procrastination Police...');
+
+                // Initialize camera
+                await this.setupCamera();
+
+                // Load models
+                await this.loadModels();
+
+                // Start detection loop
+                this.startDetection();
+            }
+
+            async setupCamera() {
+                const video = document.getElementById('videoElement');
+
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: 640, height: 480 },
+                        audio: false
+                    });
+
+                    video.srcObject = stream;
+                    await new Promise(resolve => video.onloadedmetadata = resolve);
+
+                    console.log('📹 Camera initialized');
+                } catch (error) {
+                    console.error('❌ Camera error:', error);
+                    this.updateStatus('Camera access denied. Please allow camera access.', true);
+                }
+            }
+
+            async loadModels() {
+                try {
+                    // Load COCO-SSD for phone detection (like doom-slayer)
+                    console.log('📱 Loading phone detection model...');
+                    this.cocoModel = await cocoSsd.load();
+
+                    // Load MediaPipe Face Mesh (like doom-slayer)
+                    console.log('👤 Loading face detection model...');
+                    this.faceMesh = new FaceMesh({
+                        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+                    });
+
+                    this.faceMesh.setOptions({
+                        maxNumFaces: 1,
+                        refineLandmarks: true,
+                        minDetectionConfidence: 0.5,
+                        minTrackingConfidence: 0.5
+                    });
+
+                    this.faceMesh.onResults(this.onFaceResults.bind(this));
+
+                    console.log('✅ Models loaded successfully');
+                    this.updateStatus('Models loaded. Starting calibration...', false);
+
+                } catch (error) {
+                    console.error('❌ Model loading error:', error);
+                    this.updateStatus('Failed to load detection models', true);
+                }
+            }
+
+            startDetection() {
+                const video = document.getElementById('videoElement');
+
+                const detect = async () => {
+                    if (video.readyState === 4) {
+                        // Phone detection (every 500ms like doom-slayer)
+                        if (Date.now() % 500 < 50) {
+                            await this.detectPhone();
+                        }
+
+                        // Face detection (every frame)
+                        await this.faceMesh.send({image: video});
+                    }
+
+                    requestAnimationFrame(detect);
+                };
+
+                detect();
+            }
+
+            async detectPhone() {
+                const video = document.getElementById('videoElement');
+
+                try {
+                    const predictions = await this.cocoModel.detect(video);
+
+                    // Look for cell phone (like doom-slayer)
+                    const phone = predictions.find(p => p.class === 'cell phone' && p.score > 0.25);
+                    this.phoneDetected = !!phone;
+
+                    if (phone) {
+                        console.log(`📱 Phone detected with confidence: ${phone.score.toFixed(2)}`);
+                    }
+                } catch (error) {
+                    console.error('Phone detection error:', error);
+                }
+            }
+
+            onFaceResults(results) {
+                if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                    const landmarks = results.multiFaceLandmarks[0];
+
+                    // Extract gaze metrics (like doom-slayer)
+                    const metrics = this.extractGazeMetrics(landmarks);
+
+                    if (!this.isCalibrated) {
+                        this.calibrate(metrics);
+                    } else {
+                        this.detectDoomscrolling(metrics);
+                    }
+                }
+            }
+
+            extractGazeMetrics(landmarks) {
+                // Extract key landmarks (like doom-slayer)
+                const leftEye = landmarks[33];   // Left eye corner
+                const rightEye = landmarks[263]; // Right eye corner
+                const noseTip = landmarks[1];    // Nose tip
+                const chin = landmarks[175];     // Chin
+
+                // Calculate gaze direction (simplified iris tracking like doom-slayer)
+                const gazeVertical = (leftEye.y + rightEye.y) / 2;
+                const gazeHorizontal = Math.abs(leftEye.x - rightEye.x);
+
+                // Head pose analysis
+                const faceHeight = Math.abs(chin.y - noseTip.y);
+                const faceWidth = Math.abs(leftEye.x - rightEye.x);
+
+                return {
+                    gazeVertical,
+                    gazeHorizontal,
+                    faceHeight,
+                    faceWidth,
+                    noseTip
+                };
+            }
+
+            calibrate(metrics) {
+                this.calibrationData.push(metrics);
+
+                const progress = this.calibrationData.length / this.calibrationFrames;
+                document.getElementById('calibrationProgress').style.width = `${progress * 100}%`;
+
+                this.updateStatus(`Calibrating... ${this.calibrationData.length}/${this.calibrationFrames}`, false);
+                document.getElementById('calibrationStatus').textContent =
+                    `📊 Learning your normal behavior: ${Math.round(progress * 100)}%`;
+
+                if (this.calibrationData.length >= this.calibrationFrames) {
+                    // Calculate baseline (like doom-slayer)
+                    this.baseline = {
+                        gazeVertical: this.calibrationData.reduce((a, b) => a + b.gazeVertical, 0) / this.calibrationFrames,
+                        faceHeight: this.calibrationData.reduce((a, b) => a + b.faceHeight, 0) / this.calibrationFrames
+                    };
+
+                    this.isCalibrated = true;
+                    console.log('✅ Calibration complete:', this.baseline);
+
+                    this.updateStatus('✅ Calibrated! Now monitoring for phone usage...', false);
+                    document.getElementById('calibrationStatus').textContent = '✅ Baseline established';
+                }
+            }
+
+            detectDoomscrolling(metrics) {
+                let detectionScore = 0;
+                const reasons = [];
+
+                // 1. Looking down detection (like doom-slayer thresholds)
+                const gazeDownOffset = metrics.gazeVertical - this.baseline.gazeVertical;
+                const headDownOffset = metrics.faceHeight - this.baseline.faceHeight;
+
+                if (gazeDownOffset > 0.12 || headDownOffset > 0.08) {
+                    detectionScore += 4;
+                    reasons.push('Looking down');
+                }
+
+                // 2. Phone object detected
+                if (this.phoneDetected) {
+                    detectionScore += 5;
+                    reasons.push('Phone detected');
+                }
+
+                // 3. Sensitivity adjustment (like doom-slayer)
+                const sensitivityBonus = (0.55 - this.sensitivity) * 8;
+                detectionScore += sensitivityBonus;
+
+                // 4. Detection logic (like doom-slayer)
+                if (detectionScore >= 4) {
+                    this.doomscrollCount++;
+                } else {
+                    this.doomscrollCount = Math.max(0, this.doomscrollCount - 1);
+                }
+
+                const isDoomscrolling = this.doomscrollCount >= this.detectionThreshold;
+
+                // Update UI
+                if (isDoomscrolling) {
+                    this.triggerAlert();
+                } else {
+                    this.clearAlert();
+                }
+
+                // Update status
+                const status = isDoomscrolling ? '🚨 PHONE USAGE DETECTED!' : '✅ Focused & Productive';
+                this.updateStatus(status, isDoomscrolling);
+
+                document.getElementById('detectionInfo').innerHTML = `
+                    <strong>Score:</strong> ${detectionScore.toFixed(1)} |
+                    <strong>Count:</strong> ${this.doomscrollCount}/${this.detectionThreshold}<br>
+                    <strong>Gaze offset:</strong> ${gazeDownOffset.toFixed(3)} |
+                    <strong>Phone:</strong> ${this.phoneDetected ? 'Yes' : 'No'}<br>
+                    <strong>Reasons:</strong> ${reasons.join(', ') || 'None'}
+                `;
+            }
+
+            triggerAlert() {
+                const alertBox = document.getElementById('alertBox');
+                alertBox.style.display = 'block';
+
+                // Random Office clip
+                const randomClip = this.officeClips[Math.floor(Math.random() * this.officeClips.length)];
+                alertBox.innerHTML = `
+                    📱 STOP LOOKING AT PHONE!<br>
+                    GET BACK TO WORK!<br><br>
+                    <em>"${randomClip}"</em><br>
+                    - The Office
+                `;
+
+                // Play sound (if desired)
+                if (window.speechSynthesis) {
+                    const utterance = new SpeechSynthesisUtterance("Stop looking at your phone!");
+                    window.speechSynthesis.speak(utterance);
+                }
+            }
+
+            clearAlert() {
+                document.getElementById('alertBox').style.display = 'none';
+            }
+
+            updateStatus(text, isAlert) {
+                const statusDisplay = document.getElementById('statusDisplay');
+                const statusText = document.getElementById('statusText');
+
+                statusText.textContent = text;
+                statusDisplay.className = isAlert ? 'status alert' : 'status';
+            }
+        }
+
+        // Control functions
+        function resetCalibration() {
+            if (window.detector) {
+                window.detector.calibrationData = [];
+                window.detector.baseline = null;
+                window.detector.isCalibrated = false;
+                window.detector.doomscrollCount = 0;
+                document.getElementById('calibrationProgress').style.width = '0%';
+                console.log('🔄 Calibration reset');
+            }
+        }
+
+        function toggleSensitivity() {
+            if (window.detector) {
+                const levels = [0.3, 0.5, 0.7];
+                const names = ['High', 'Medium', 'Low'];
+                const currentIndex = levels.indexOf(window.detector.sensitivity);
+                const nextIndex = (currentIndex + 1) % levels.length;
+
+                window.detector.sensitivity = levels[nextIndex];
+                document.getElementById('sensitivityLevel').textContent = names[nextIndex];
+                console.log(`⚙️ Sensitivity: ${names[nextIndex]}`);
+            }
+        }
+
+        function addOfficeClip() {
+            const clip = prompt('Add a new Office clip quote:');
+            if (clip && window.detector) {
+                window.detector.officeClips.push(clip);
+                alert('Office clip added! 🎬');
+            }
+        }
+
+        // Initialize when page loads
+        window.addEventListener('load', () => {
+            window.detector = new ProcrastinationDetector();
+        });
+    </script>
+</body>
+</html>
