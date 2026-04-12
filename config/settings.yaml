@@ -1,0 +1,45 @@
+# Procrastination Police Configuration
+
+# Camera settings
+camera:
+  device_id: 0
+  width: 640
+  height: 480
+  fps: 30
+
+# Face detection
+face_detection:
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+
+# Gaze detection zones
+gaze_zones:
+  # Define "phone zone" - looking down and slightly right
+  phone_zone:
+    pitch_min: 15    # Looking down (degrees)
+    pitch_max: 45
+    yaw_min: -30     # Slightly left to right
+    yaw_max: 30
+
+  # How long to look at phone before triggering (seconds)
+  trigger_delay: 3.0
+
+  # Cooldown between triggers (seconds)
+  cooldown: 30.0
+
+# Popup settings
+popup:
+  duration: 5.0      # How long to show clip (seconds)
+  volume: 0.8        # Audio volume (0.0 - 1.0)
+
+# Work hours (24-hour format)
+work_hours:
+  enabled: true
+  start: "09:00"
+  end: "17:00"
+  weekdays_only: true
+
+# Stats tracking
+stats:
+  enabled: true
+  log_file: "procrastination_log.json"
