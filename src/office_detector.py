@@ -74,9 +74,33 @@ class OfficeClipDetector:
         print("📱 Then: Looking down for 2+ seconds = SHAME CLIP!")
 
     def setup_phone_detection(self):
-        """Setup simple phone detection using contour analysis"""
-        # We'll use OpenCV-based phone detection instead of TensorFlow for simplicity
-        print("📱 Phone detection ready (OpenCV-based)")
+        """Setup YOLO phone detection"""
+        try:
+            from ultralytics import YOLO
+            self.yolo = YOLO('yolov8n.pt')  # Downloads once (~6MB)
+            self.yolo_enabled = True
+            print("📱 Phone detection ready (YOLOv8)")
+        except Exception as e:
+            self.yolo = None
+            self.yolo_enabled = False
+            print(f"⚠️  YOLO unavailable: {e}")
+
+    def detect_phone_object_yolo(self, frame):
+        """Detect phone using YOLOv8 - class 67 = cell phone in COCO"""
+        if not self.yolo_enabled:
+            return False, []
+        try:
+            results = self.yolo(frame, verbose=False, conf=0.35)
+            phone_boxes = []
+            for r in results:
+                for box in r.boxes:
+                    if int(box.cls) == 67:  # COCO class 67 = cell phone
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        conf = float(box.conf[0])
+                        phone_boxes.append((x1, y1, x2 - x1, y2 - y1, f"yolo:{conf:.2f}"))
+            return len(phone_boxes) > 0, phone_boxes
+        except Exception as e:
+            return False, []
 
     def detect_phone_object(self, frame):
         """Enhanced phone detection - avoid wall false positives"""
@@ -227,22 +251,31 @@ class OfficeClipDetector:
         }
 
     def calculate_gaze_ratio(self, landmarks):
-        """Exact iris tracking from Skyrim edition"""
-        # Eye corner landmarks (exact from original)
-        left = [landmarks[145], landmarks[159]]   # Left eye corners
-        right = [landmarks[374], landmarks[386]]  # Right eye corners
+        """Head tilt detection using nose/eye/chin landmarks.
+        Returns ratio: higher = more tilted down (looking at phone)"""
+        nose   = landmarks[1]
+        chin   = landmarks[152]
+        l_eye  = landmarks[33]
+        r_eye  = landmarks[263]
 
-        # Iris landmarks (exact from original)
-        l_iris = landmarks[468]  # Left iris
-        r_iris = landmarks[473]  # Right iris
+        # Vertical midpoint of eyes
+        eye_mid_y = (l_eye.y + r_eye.y) / 2.0
 
-        # Calculate ratios (exact formula from original)
-        l_ratio = (l_iris.y - left[1].y) / (left[0].y - left[1].y + 1e-6)
-        r_ratio = (r_iris.y - right[1].y) / (right[0].y - right[1].y + 1e-6)
+        # Face height (eye to chin)
+        face_h = chin.y - eye_mid_y + 1e-6
 
-        avg_ratio = (l_ratio + r_ratio) / 2.0
+        # Nose distance below eyes, normalised by face height
+        # When looking DOWN: nose appears higher in face → smaller ratio
+        # When looking at SCREEN normally: nose is lower → larger ratio
+        ratio = (nose.y - eye_mid_y) / face_h
 
-        return avg_ratio, l_iris, r_iris, left, right
+        # Fake iris/left/right returns so rest of code doesn't break
+        l_iris = landmarks[468] if len(landmarks) > 468 else nose
+        r_iris = landmarks[473] if len(landmarks) > 473 else nose
+        left  = [l_eye, l_eye]
+        right = [r_eye, r_eye]
+
+        return ratio, l_iris, r_iris, left, right
 
     def detect_looking_down(self, avg_ratio, eye_state, phone_detected):
         """Detection: phone in view OR iris deviated from baseline"""
@@ -368,10 +401,10 @@ audio.terminate()
                     # Detect eye state (open/closed/looking down)
                     eye_state = self.detect_eye_state(landmarks)
 
-                    # Phone detection (every 500ms like doom-slayer)
+                    # Phone detection via YOLO (every 500ms)
                     current_time = time.time()
                     if current_time - self.last_phone_check > self.phone_check_interval:
-                        self.phone_detected, phone_candidates = self.detect_phone_object(frame)
+                        self.phone_detected, phone_candidates = self.detect_phone_object_yolo(frame)
                         self.last_phone_check = current_time
 
                         # Debug: Print detection results
