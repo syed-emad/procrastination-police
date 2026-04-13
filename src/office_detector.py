@@ -7,6 +7,7 @@ Combines:
 - Eye state detection (open/closed)
 """
 
+import sys
 import cv2
 import mediapipe as mp
 import time
@@ -48,7 +49,7 @@ class OfficeClipDetector:
         # Phone detection setup
         self.phone_detected = False
         self.last_phone_check = 0
-        self.phone_check_interval = 0.5  # Check every 500ms like doom-slayer
+        self.phone_check_interval = 0.2  # Check every 200ms
 
         # Temporal smoothing: track last N raw YOLO results
         # Phone "confirmed present"  = ≥2 of last 4 checks detected it
@@ -117,13 +118,17 @@ class OfficeClipDetector:
 
                     if cls_id == 67:  # cell phone
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        if conf >= 0.20:
+                        h_frame = frame.shape[0]
+                        center_y = (y1 + y2) // 2
+                        if center_y > h_frame * 0.75:  # ignore bottom 25% (recording phone)
+                            continue
+                        if conf >= 0.12:
                             phone_boxes.append((x1, y1, x2 - x1, y2 - y1, f"yolo:{conf:.2f}"))
                             if self.debug_phone:
                                 print(f"[YOLO] ✅ PHONE ACCEPTED  cls=67  conf={conf:.3f}")
                         else:
                             if self.debug_phone:
-                                print(f"[YOLO] ⚠️  PHONE REJECTED  cls=67  conf={conf:.3f}  (below 0.20 threshold)")
+                                print(f"[YOLO] ⚠️  PHONE REJECTED  cls=67  conf={conf:.3f}  (below 0.12 threshold)")
                     elif cls_id == 65 and conf >= 0.35:
                         # YOLOv8n frequently misclassifies phones as "remote" — treat as phone
                         # (no actual remote in this setup, so all remote detections = phone)
@@ -216,7 +221,7 @@ class OfficeClipDetector:
         # Signal 2: Iris ratio deviated DOWN from baseline (looking down = ratio drops)
         if self.baseline_ratio is not None:
             deviation = self.baseline_ratio - avg_ratio  # positive = looking down
-            if deviation > 0.04:
+            if deviation > 0.025:
                 reasons.append(f"Iris down ({deviation:.3f} below baseline)")
         else:
             if avg_ratio < self.looking_down_threshold:
@@ -227,13 +232,31 @@ class OfficeClipDetector:
 
         return is_detected, " | ".join(reasons) if reasons else "No signal"
 
+    def _build_ordered_playlist(self):
+        """Fixed order: Oh God → Stay Calm short → Where are turtles → Stay Calm long → repeat"""
+        order_keywords = [
+            "oh god please",       # "Oh God Please no edit.mov"
+            "stay fucking calm short",  # short version second
+            "where are the turtles",    # turtles third
+            "stay fucking calm",        # full version fourth
+        ]
+        ordered = []
+        for kw in order_keywords:
+            match = next((c for c in self.office_clips if kw in os.path.basename(c).lower()), None)
+            if match:
+                ordered.append(match)
+        # Append any clips not matched by keywords
+        for c in self.office_clips:
+            if c not in ordered:
+                ordered.append(c)
+        return ordered
+
     def _next_clip(self) -> str:
-        """Return next clip from shuffled queue, refilling when empty."""
+        """Return next clip in fixed rotation, looping forever."""
         if not self._clip_queue:
-            self._clip_queue = list(self.office_clips)
-            random.shuffle(self._clip_queue)
-            print(f"[Clips] Shuffled playlist: {[os.path.basename(c) for c in self._clip_queue]}")
-        return self._clip_queue.pop()
+            self._clip_queue = self._build_ordered_playlist()
+            print(f"[Clips] Playlist order: {[os.path.basename(c) for c in self._clip_queue]}")
+        return self._clip_queue.pop(0)  # pop from front to preserve order
 
     def play_office_clip(self):
         """Play next Office clip (shuffle rotation) in a popup via separate process."""
@@ -244,43 +267,12 @@ class OfficeClipDetector:
         clip_path = self._next_clip()
         print(f"🎬 Playing: {os.path.basename(clip_path)}")
 
-        # Popup player script — runs in its own process so cv2 GUI works on macOS
-        popup_script = f"""
-import cv2, subprocess, sys
-
-clip_path = {repr(clip_path)}
-cap = cv2.VideoCapture(clip_path)
-fps = cap.get(cv2.CAP_PROP_FPS) or 30
-delay = int(1000 / fps)
-
-audio = subprocess.Popen(['afplay', clip_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-cv2.namedWindow('GET BACK TO WORK', cv2.WINDOW_NORMAL)
-cv2.resizeWindow('GET BACK TO WORK', 480, 360)
-cv2.moveWindow('GET BACK TO WORK', 700, 150)
-
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
-    frame = cv2.resize(frame, (480, 360))
-    cv2.rectangle(frame, (0, 0), (480, 55), (0, 0, 180), -1)
-    cv2.putText(frame, 'PUT THE PHONE DOWN!', (15, 38),
-                cv2.FONT_HERSHEY_DUPLEX, 0.95, (255, 255, 255), 2)
-    cv2.imshow('GET BACK TO WORK', frame)
-    if cv2.waitKey(delay) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-audio.terminate()
-"""
-
-        import sys
+        # Call the standalone popup_player.py — much faster startup than inline script
+        popup_player = os.path.join(os.path.dirname(__file__), 'popup_player.py')
 
         def launch():
             proc = subprocess.Popen(
-                [sys.executable, '-c', popup_script],
+                [sys.executable, popup_player, clip_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -293,6 +285,51 @@ audio.terminate()
             self.video_playing = False
 
         threading.Thread(target=launch, daemon=True).start()
+
+    def draw_hud(self, frame, landmarks, phone_candidates, is_looking_down):
+        """Aesthetic HUD: corner brackets on eyes + phone box"""
+        h, w = frame.shape[:2]
+        active = is_looking_down
+        eye_color   = (0, 80, 255)   if active else (0, 220, 180)   # red-ish : teal
+        phone_color = (0, 80, 255)   if active else (0, 200, 255)   # red-ish : cyan
+
+        def corner_brackets(frame, x, y, bw, bh, color, arm=10, thickness=2):
+            """Draw 4 L-shaped corner brackets instead of a full rectangle"""
+            pts = [
+                # top-left
+                ((x, y + arm),        (x, y),        (x + arm, y)),
+                # top-right
+                ((x+bw-arm, y),       (x+bw, y),     (x+bw, y + arm)),
+                # bottom-left
+                ((x, y+bh-arm),       (x, y+bh),     (x + arm, y+bh)),
+                # bottom-right
+                ((x+bw-arm, y+bh),    (x+bw, y+bh),  (x+bw, y+bh-arm)),
+            ]
+            for p1, vertex, p2 in pts:
+                cv2.line(frame, p1, vertex, color, thickness, cv2.LINE_AA)
+                cv2.line(frame, vertex, p2, color, thickness, cv2.LINE_AA)
+
+        # ── Eye brackets ──────────────────────────────────────────────
+        # Use outer/inner eye corners to bound each eye
+        eye_pairs = [
+            (landmarks[33],  landmarks[133]),   # left eye:  outer → inner
+            (landmarks[362], landmarks[263]),   # right eye: inner → outer
+        ]
+        for lm_a, lm_b in eye_pairs:
+            px1 = int(min(lm_a.x, lm_b.x) * w)
+            py1 = int(min(lm_a.y, lm_b.y) * h)
+            px2 = int(max(lm_a.x, lm_b.x) * w)
+            py2 = int(max(lm_a.y, lm_b.y) * h)
+            pad_x, pad_y = max(10, (px2 - px1) // 2), max(8, (py2 - py1))
+            corner_brackets(frame, px1 - pad_x, py1 - pad_y,
+                            (px2 - px1) + pad_x * 2, (py2 - py1) + pad_y * 2,
+                            eye_color, arm=8, thickness=2)
+
+        # ── Phone box ─────────────────────────────────────────────────
+        for (px, py, pw, ph, _) in phone_candidates:
+            corner_brackets(frame, px, py, pw, ph, phone_color, arm=16, thickness=2)
+            cv2.putText(frame, 'PHONE', (px, py - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, phone_color, 1, cv2.LINE_AA)
 
     def stop_office_clip(self):
         """Stop the Office clip and kill the popup process"""
@@ -346,7 +383,8 @@ audio.terminate()
                     # Detect eye state (open/closed/looking down)
                     eye_state = self.detect_eye_state(landmarks)
 
-                    # Phone detection via YOLO (every 500ms)
+                    # Phone detection via YOLO (every 200ms)
+                    phone_candidates = []  # reset each frame; updated inside gate
                     current_time = time.time()
                     if current_time - self.last_phone_check > self.phone_check_interval:
                         if self.debug_phone:
@@ -359,8 +397,8 @@ audio.terminate()
                         hits = sum(self.phone_history)
                         history_len = len(self.phone_history)
 
-                        # Confirm PRESENT: ≥2 of last 4 checks saw phone
-                        if hits >= 2:
+                        # Confirm PRESENT: any single detection is enough
+                        if hits >= 1:
                             self.phone_confirmed = True
                         # Confirm GONE: 0 of last 3 checks saw phone (requires 3 consecutive misses)
                         elif history_len >= 3 and hits == 0:
@@ -404,8 +442,11 @@ audio.terminate()
                     else:
                         self.start_time = None
 
+                    # HUD overlay — eyes + phone brackets
+                    self.draw_hud(frame, landmarks, phone_candidates if self.phone_detected else [], is_looking_down)
 
             cv2.imshow('Procrastination Police - Office Edition', frame)
+            cv2.moveWindow('Procrastination Police - Office Edition', 760, 100)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
