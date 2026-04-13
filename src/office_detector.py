@@ -361,6 +361,8 @@ class OfficeClipDetector:
         print("📹 Starting webcam detection...")
         print("Press 'q' to quit")
 
+        phone_candidates = []  # persists between YOLO checks so brackets don't flicker
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -384,7 +386,7 @@ class OfficeClipDetector:
                     eye_state = self.detect_eye_state(landmarks)
 
                     # Phone detection via YOLO (every 200ms)
-                    phone_candidates = []  # reset each frame; updated inside gate
+                    # phone_candidates kept from last check so brackets don't flicker
                     current_time = time.time()
                     if current_time - self.last_phone_check > self.phone_check_interval:
                         if self.debug_phone:
@@ -403,6 +405,7 @@ class OfficeClipDetector:
                         # Confirm GONE: 0 of last 3 checks saw phone (requires 3 consecutive misses)
                         elif history_len >= 3 and hits == 0:
                             self.phone_confirmed = False
+                            phone_candidates = []  # clear brackets when phone gone
 
                         self.phone_detected = self.phone_confirmed
 
@@ -429,18 +432,13 @@ class OfficeClipDetector:
                     # Multi-modal detection
                     is_looking_down, detection_reason = self.detect_looking_down(avg_ratio, eye_state, self.phone_detected)
 
-                    # Trigger logic
+                    # Trigger logic — fire immediately on first detection
                     now = time.time()
                     on_cooldown = (now - self.last_clip_time) < self.clip_cooldown
 
-                    if is_looking_down:
-                        if self.start_time is None:
-                            self.start_time = now
-                        elif now - self.start_time >= self.timer and not self.video_playing and not on_cooldown:
-                            self.play_office_clip()
-                            self.last_clip_time = now
-                    else:
-                        self.start_time = None
+                    if is_looking_down and not self.video_playing and not on_cooldown:
+                        self.play_office_clip()
+                        self.last_clip_time = now
 
                     # HUD overlay — eyes + phone brackets
                     self.draw_hud(frame, landmarks, phone_candidates if self.phone_detected else [], is_looking_down)
