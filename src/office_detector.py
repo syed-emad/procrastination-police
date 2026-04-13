@@ -16,6 +16,7 @@ import subprocess
 import pygame
 import numpy as np
 import threading
+from collections import deque
 
 
 class OfficeClipDetector:
@@ -49,6 +50,12 @@ class OfficeClipDetector:
         self.last_phone_check = 0
         self.phone_check_interval = 0.5  # Check every 500ms like doom-slayer
 
+        # Temporal smoothing: track last N raw YOLO results
+        # Phone "confirmed present"  = ≥2 of last 4 checks detected it
+        # Phone "confirmed gone"     = 0 of last 3 checks detected it  (requires 3 consecutive misses)
+        self.phone_history = deque(maxlen=4)
+        self.phone_confirmed = False  # smoothed state used for triggering
+
         # Load phone detection model (simplified COCO-like detection)
         self.setup_phone_detection()
 
@@ -65,6 +72,9 @@ class OfficeClipDetector:
                 print(f"   • {os.path.basename(clip)}")
         else:
             print("⚠️  No clips found in assets/office-clips/")
+
+        # Shuffle-based playlist so the same clip never repeats back-to-back
+        self._clip_queue: list = []
 
         # Initialize pygame for sound
         pygame.mixer.init()
@@ -217,13 +227,21 @@ class OfficeClipDetector:
 
         return is_detected, " | ".join(reasons) if reasons else "No signal"
 
+    def _next_clip(self) -> str:
+        """Return next clip from shuffled queue, refilling when empty."""
+        if not self._clip_queue:
+            self._clip_queue = list(self.office_clips)
+            random.shuffle(self._clip_queue)
+            print(f"[Clips] Shuffled playlist: {[os.path.basename(c) for c in self._clip_queue]}")
+        return self._clip_queue.pop()
+
     def play_office_clip(self):
-        """Play random Office clip in a popup via separate process (macOS thread-safe)"""
+        """Play next Office clip (shuffle rotation) in a popup via separate process."""
         if self.video_playing or not self.office_clips:
             return
 
         self.video_playing = True
-        clip_path = random.choice(self.office_clips)
+        clip_path = self._next_clip()
         print(f"🎬 Playing: {os.path.basename(clip_path)}")
 
         # Popup player script — runs in its own process so cv2 GUI works on macOS
@@ -333,31 +351,31 @@ audio.terminate()
                     if current_time - self.last_phone_check > self.phone_check_interval:
                         if self.debug_phone:
                             print(f"[YOLO] --- check at t={current_time:.2f} ---")
-                        self.phone_detected, phone_candidates = self.detect_phone_object_yolo(frame)
+                        raw_detected, phone_candidates = self.detect_phone_object_yolo(frame)
                         self.last_phone_check = current_time
 
-                        if self.debug_phone:
-                            result_str = f"{len(phone_candidates)} box(es)" if phone_candidates else "not detected"
-                            print(f"[YOLO] phone_detected={self.phone_detected}  ({result_str})")
+                        # Update smoothing history
+                        self.phone_history.append(raw_detected)
+                        hits = sum(self.phone_history)
+                        history_len = len(self.phone_history)
 
-                        # Stop clip immediately if phone left the frame
-                        if self.video_playing and not self.phone_detected:
+                        # Confirm PRESENT: ≥2 of last 4 checks saw phone
+                        if hits >= 2:
+                            self.phone_confirmed = True
+                        # Confirm GONE: 0 of last 3 checks saw phone (requires 3 consecutive misses)
+                        elif history_len >= 3 and hits == 0:
+                            self.phone_confirmed = False
+
+                        self.phone_detected = self.phone_confirmed
+
+                        if self.debug_phone:
+                            raw_str = f"{len(phone_candidates)} box(es)" if phone_candidates else "not detected"
+                            print(f"[YOLO] raw={raw_detected} ({raw_str})  |  history={list(self.phone_history)}  hits={hits}  confirmed={self.phone_confirmed}")
+
+                        # Stop clip only when phone is confirmed gone (not on a single miss)
+                        if self.video_playing and not self.phone_confirmed:
                             self.stop_office_clip()
 
-                        # Draw phone detection results with different colors per method
-                        if phone_candidates:
-                            for (px, py, pw, ph, method) in phone_candidates:
-                                # Different colors for different detection methods
-                                if method.startswith("yolo"):
-                                    color = (0, 165, 255)  # Orange for YOLO
-                                    label = f"Phone {method.split(':')[1]}"
-                                else:
-                                    color = (128, 128, 128)
-                                    label = method
-
-                                cv2.rectangle(frame, (px, py), (px+pw, py+ph), color, 3)
-                                cv2.putText(frame, f"📱{label}", (px, py-10),
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                     # Calibration phase - learn normal screen-looking position
                     if self.is_calibrating:
@@ -385,46 +403,7 @@ audio.terminate()
                             self.last_clip_time = now
                     else:
                         self.start_time = None
-                        self.video_playing = False  # Reset so next detection can trigger
 
-                    # Visual feedback (like original)
-                    h, w = frame.shape[:2]
-
-                    # Draw head-tilt landmarks: eye centers (green) and nose (blue)
-                    for point in [left[0], right[0]]:
-                        cv2.circle(frame, (int(point.x * w), int(point.y * h)), 4, (0, 255, 0), -1)
-                    cv2.circle(frame, (int(l_iris.x * w), int(l_iris.y * h)), 4, (255, 100, 0), -1)
-
-                    # Status display
-                    if self.is_calibrating:
-                        status_color = (255, 255, 0)  # Yellow during calibration
-                        status_text = f"CALIBRATING: {self.calibration_count}/{self.max_calibration_frames} | Ratio: {avg_ratio:.3f}"
-                        cv2.putText(frame, "Look at your SCREEN normally", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    else:
-                        status_color = (0, 0, 255) if is_looking_down else (0, 255, 0)
-                        baseline_text = f" | Base: {self.baseline_ratio:.3f}" if self.baseline_ratio else ""
-                        status_text = f"Down: {is_looking_down} | Ratio: {avg_ratio:.3f}{baseline_text}"
-
-                        # Multi-modal status
-                        eye_status = "👀" if eye_state['eyes_open'] else "👁️" if not eye_state['eyes_closed'] else "😴"
-                        phone_status = "📱" if self.phone_detected else "❌"
-                        indicators_text = f"{eye_status} EAR:{eye_state['eye_aspect_ratio']:.2f} | {phone_status} Phone | {detection_reason}"
-
-                        cv2.putText(frame, indicators_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                    cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-
-                    # Timer display
-                    if self.start_time:
-                        elapsed = time.time() - self.start_time
-                        timer_text = f"Timer: {elapsed:.1f}/{self.timer}s"
-                        cv2.putText(frame, timer_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-                    # Video status
-                    if self.video_playing:
-                        cv2.rectangle(frame, (10, 10), (w-10, 100), (0, 0, 255), 3)
-                        cv2.putText(frame, "OFFICE CLIP PLAYING!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                        cv2.putText(frame, "Look up to stop!", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             cv2.imshow('Procrastination Police - Office Edition', frame)
 
