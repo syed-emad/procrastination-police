@@ -130,9 +130,9 @@ class OfficeClipDetector:
                             if self.debug_phone:
                                 print(f"[YOLO] ⚠️  PHONE REJECTED  cls=67  conf={conf:.3f}  (below 0.12 threshold)")
                     elif cls_id == 65 and conf >= 0.35:
-                        # YOLOv8n frequently misclassifies phones as "remote" — treat as phone
-                        # (no actual remote in this setup, so all remote detections = phone)
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        if (y1 + y2) // 2 > frame.shape[0] * 0.90:
+                            continue
                         phone_boxes.append((x1, y1, x2 - x1, y2 - y1, f"yolo-remote:{conf:.2f}"))
                         if self.debug_phone:
                             print(f"[YOLO] ✅ REMOTE→PHONE  cls=65  conf={conf:.3f}  (phone misclassified as remote)")
