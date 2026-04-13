@@ -282,6 +282,8 @@ audio.terminate()
             return
 
         self.video_playing = False
+        self.start_time = None  # force timer to restart from scratch on next detection
+        self.last_clip_time = time.time() - self.clip_cooldown + 3  # 3s buffer before re-trigger
         print("📵 Phone gone — clip stopped!")
 
         # Kill the popup video window
