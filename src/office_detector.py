@@ -233,22 +233,15 @@ class OfficeClipDetector:
         return is_detected, " | ".join(reasons) if reasons else "No signal"
 
     def _build_ordered_playlist(self):
-        """Fixed order: Oh God → Stay Calm short → Where are turtles → Stay Calm long → repeat"""
-        order_keywords = [
-            "oh god please",       # "Oh God Please no edit.mov"
-            "stay fucking calm short",  # short version second
-            "where are the turtles",    # turtles third
-            "stay fucking calm",        # full version fourth
+        """Fixed 3-clip rotation matched by exact filename."""
+        exact_order = [
+            "Oh God Please no edit.mov",
+            "Stay Fucking Calm short.mov",
+            "Where are the turtles.mov",
         ]
-        ordered = []
-        for kw in order_keywords:
-            match = next((c for c in self.office_clips if kw in os.path.basename(c).lower()), None)
-            if match:
-                ordered.append(match)
-        # Append any clips not matched by keywords
-        for c in self.office_clips:
-            if c not in ordered:
-                ordered.append(c)
+        clips_by_name = {os.path.basename(c): c for c in self.office_clips}
+        ordered = [clips_by_name[name] for name in exact_order if name in clips_by_name]
+        print(f"[Clips] Rotation: {[os.path.basename(c) for c in ordered]}")
         return ordered
 
     def _next_clip(self) -> str:
