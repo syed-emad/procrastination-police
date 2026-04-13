@@ -27,6 +27,7 @@ class OfficeClipDetector:
 
         # State tracking
         self.video_playing = False
+        self.video_proc = None  # subprocess handle so we can kill it
         self.start_time = None
         self.last_clip_time = 0
         self.clip_cooldown = 15.0  # seconds before next clip can trigger
@@ -75,11 +76,13 @@ class OfficeClipDetector:
 
     def setup_phone_detection(self):
         """Setup YOLO phone detection"""
+        self.debug_phone = True  # Set False to silence verbose YOLO logs
         try:
             from ultralytics import YOLO
             self.yolo = YOLO('yolov8n.pt')  # Downloads once (~6MB)
             self.yolo_enabled = True
             print("📱 Phone detection ready (YOLOv8)")
+            print(f"   conf threshold: 0.35 | class 67 = cell phone")
         except Exception as e:
             self.yolo = None
             self.yolo_enabled = False
@@ -90,136 +93,48 @@ class OfficeClipDetector:
         if not self.yolo_enabled:
             return False, []
         try:
-            results = self.yolo(frame, verbose=False, conf=0.35)
+            # Run with a low conf floor so we can see near-misses in the logs
+            results = self.yolo(frame, verbose=False, conf=0.10)
             phone_boxes = []
+            all_detections = []  # every detection this frame for debug
+
             for r in results:
                 for box in r.boxes:
-                    if int(box.cls) == 67:  # COCO class 67 = cell phone
+                    cls_id  = int(box.cls[0])
+                    conf    = float(box.conf[0])
+                    label   = self.yolo.names.get(cls_id, str(cls_id))
+                    all_detections.append((cls_id, label, conf))
+
+                    if cls_id == 67:  # cell phone
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        conf = float(box.conf[0])
-                        phone_boxes.append((x1, y1, x2 - x1, y2 - y1, f"yolo:{conf:.2f}"))
+                        if conf >= 0.20:
+                            phone_boxes.append((x1, y1, x2 - x1, y2 - y1, f"yolo:{conf:.2f}"))
+                            if self.debug_phone:
+                                print(f"[YOLO] ✅ PHONE ACCEPTED  cls=67  conf={conf:.3f}")
+                        else:
+                            if self.debug_phone:
+                                print(f"[YOLO] ⚠️  PHONE REJECTED  cls=67  conf={conf:.3f}  (below 0.20 threshold)")
+                    elif cls_id == 65 and conf >= 0.35:
+                        # YOLOv8n frequently misclassifies phones as "remote" — treat as phone
+                        # (no actual remote in this setup, so all remote detections = phone)
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        phone_boxes.append((x1, y1, x2 - x1, y2 - y1, f"yolo-remote:{conf:.2f}"))
+                        if self.debug_phone:
+                            print(f"[YOLO] ✅ REMOTE→PHONE  cls=65  conf={conf:.3f}  (phone misclassified as remote)")
+
+            if self.debug_phone:
+                if all_detections:
+                    # Show top-5 by confidence so logs don't spam on busy frames
+                    top = sorted(all_detections, key=lambda d: d[2], reverse=True)[:5]
+                    top_str = "  |  ".join(f"{label}({conf:.2f})" for _, label, conf in top)
+                    print(f"[YOLO] top detections: {top_str}")
+                else:
+                    print("[YOLO] no detections above 0.10 this frame")
+
             return len(phone_boxes) > 0, phone_boxes
         except Exception as e:
+            print(f"[YOLO] error: {e}")
             return False, []
-
-    def detect_phone_object(self, frame):
-        """Enhanced phone detection - avoid wall false positives"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-
-        phone_candidates = []
-
-        # Method 1: Edge detection (original - more restrictive)
-        edges = cv2.Canny(gray, 40, 120)  # Slightly higher thresholds
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for contour in contours:
-            x, y, cw, ch = cv2.boundingRect(contour)
-            aspect_ratio = ch / cw if cw > 0 else 0
-            area = cv2.contourArea(contour)
-
-            # More restrictive criteria for edges
-            if (1.5 < aspect_ratio < 3.5 and     # Stricter aspect ratio
-                800 < area < 15000 and           # Smaller max area (no walls!)
-                30 < cw < 200 and               # Phone-sized width limits
-                50 < ch < 400 and               # Phone-sized height limits
-                x > w//10 and x < w*9//10 and    # Not at edges (avoid walls)
-                y > h//10 and y < h*9//10):      # Not at edges (avoid walls)
-
-                # Check if it's actually a rectangular object (not just noise)
-                hull = cv2.convexHull(contour)
-                hull_area = cv2.contourArea(hull)
-                if area / hull_area > 0.7:  # Should be reasonably rectangular
-                    phone_candidates.append((x, y, cw, ch, "edge"))
-
-        # Method 2: Template matching (more restrictive)
-        templates_found = 0
-        for width, height in [(60, 120), (80, 160), (50, 100)]:
-            if width < w//6 and height < h//6:  # Smaller max size
-                template = np.ones((height, width), dtype=np.uint8) * 200  # Lighter template
-                cv2.rectangle(template, (3, 3), (width-4, height-4), 255, 2)
-
-                res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-                locations = np.where(res >= 0.4)  # Higher threshold
-
-                for pt in zip(*locations[::-1]):
-                    # Avoid edge areas (where walls might be)
-                    if (w//8 < pt[0] < w*7//8 and h//8 < pt[1] < h*7//8):
-                        templates_found += 1
-                        if templates_found <= 2:  # Limit template matches
-                            phone_candidates.append((pt[0], pt[1], width, height, "template"))
-
-        # Method 3: Color-based detection (MUCH more restrictive for white)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # Much more specific white range (avoid walls)
-        lower_white = np.array([0, 0, 200])    # Higher brightness threshold
-        upper_white = np.array([180, 20, 255])  # Lower saturation threshold
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
-
-        # Morphological operations to clean up noise
-        kernel = np.ones((3,3), np.uint8)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-
-        white_contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        white_regions = 0
-        for contour in white_contours:
-            x, y, cw, ch = cv2.boundingRect(contour)
-            aspect_ratio = ch / cw if cw > 0 else 0
-            area = cv2.contourArea(contour)
-
-            # Very restrictive criteria for white regions
-            if (1.3 < aspect_ratio < 3.8 and      # Phone aspect ratio
-                1200 < area < 25000 and           # Much smaller max (no walls!)
-                40 < cw < 150 and                 # Phone-width range
-                60 < ch < 300 and                 # Phone-height range
-                w//6 < x < w*5//6 and             # Center area only (no walls)
-                h//6 < y < h*5//6):               # Center area only (no walls)
-
-                # Additional check: white region should be compact
-                hull = cv2.convexHull(contour)
-                hull_area = cv2.contourArea(hull)
-                if area / hull_area > 0.75:  # Should be very rectangular
-                    white_regions += 1
-                    if white_regions <= 1:  # Only one white region at a time
-                        phone_candidates.append((x, y, cw, ch, "color"))
-
-        # Much more aggressive duplicate removal
-        filtered_candidates = []
-        for i, (x1, y1, w1, h1, method1) in enumerate(phone_candidates):
-            # Check if this region is reasonable for a phone in hands
-            center_x, center_y = x1 + w1//2, y1 + h1//2
-
-            # Phone should be in lower 2/3 of frame (hand-held region)
-            if center_y < h//3:
-                continue  # Skip objects in top third (likely not handheld)
-
-            # Phone should not be too close to edges (likely wall/background)
-            if (x1 < w//8 or x1 + w1 > w*7//8 or
-                y1 < h//8 or y1 + h1 > h*7//8):
-                continue
-
-            is_duplicate = False
-            for j, (x2, y2, w2, h2, method2) in enumerate(phone_candidates[i+1:], i+1):
-                # Check overlap
-                overlap_x = max(0, min(x1+w1, x2+w2) - max(x1, x2))
-                overlap_y = max(0, min(y1+h1, y2+h2) - max(y1, y2))
-                overlap_area = overlap_x * overlap_y
-
-                if overlap_area > 0.2 * min(w1*h1, w2*h2):  # 20% overlap
-                    is_duplicate = True
-                    break
-
-            if not is_duplicate:
-                filtered_candidates.append((x1, y1, w1, h1, method1))
-
-        # Limit total phone detections (prevent wall spam)
-        if len(filtered_candidates) > 2:
-            filtered_candidates = filtered_candidates[:2]
-
-        return len(filtered_candidates) > 0, filtered_candidates
 
     def detect_eye_state(self, landmarks):
         """Detect if eyes are open, closed, or looking down"""
@@ -351,18 +266,28 @@ audio.terminate()
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            proc.wait()  # Wait for popup to close
+            self.video_proc = proc
+            try:
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            self.video_proc = None
             self.video_playing = False
 
         threading.Thread(target=launch, daemon=True).start()
 
     def stop_office_clip(self):
-        """Stop the Office clip"""
+        """Stop the Office clip and kill the popup process"""
         if not self.video_playing:
             return
 
         self.video_playing = False
-        print("✅ Office clip stopped - back to work!")
+        print("📵 Phone gone — clip stopped!")
+
+        # Kill the popup video window
+        if self.video_proc and self.video_proc.poll() is None:
+            self.video_proc.kill()
+            self.video_proc = None
 
         # Kill audio
         try:
@@ -404,30 +329,29 @@ audio.terminate()
                     # Phone detection via YOLO (every 500ms)
                     current_time = time.time()
                     if current_time - self.last_phone_check > self.phone_check_interval:
+                        if self.debug_phone:
+                            print(f"[YOLO] --- check at t={current_time:.2f} ---")
                         self.phone_detected, phone_candidates = self.detect_phone_object_yolo(frame)
                         self.last_phone_check = current_time
 
-                        # Debug: Print detection results
-                        if phone_candidates:
-                            methods = [candidate[4] for candidate in phone_candidates]
-                            print(f"📱 Phone detected via: {', '.join(set(methods))}")
+                        if self.debug_phone:
+                            result_str = f"{len(phone_candidates)} box(es)" if phone_candidates else "not detected"
+                            print(f"[YOLO] phone_detected={self.phone_detected}  ({result_str})")
+
+                        # Stop clip immediately if phone left the frame
+                        if self.video_playing and not self.phone_detected:
+                            self.stop_office_clip()
 
                         # Draw phone detection results with different colors per method
                         if phone_candidates:
                             for (px, py, pw, ph, method) in phone_candidates:
                                 # Different colors for different detection methods
-                                if method == "edge":
-                                    color = (255, 0, 255)  # Magenta for edge detection
-                                    label = "Edge"
-                                elif method == "template":
-                                    color = (0, 255, 255)  # Cyan for template matching
-                                    label = "Template"
-                                elif method == "color":
-                                    color = (255, 255, 0)  # Yellow for color detection
-                                    label = "Color"
+                                if method.startswith("yolo"):
+                                    color = (0, 165, 255)  # Orange for YOLO
+                                    label = f"Phone {method.split(':')[1]}"
                                 else:
-                                    color = (128, 128, 128)  # Gray for unknown
-                                    label = "Unknown"
+                                    color = (128, 128, 128)
+                                    label = method
 
                                 cv2.rectangle(frame, (px, py), (px+pw, py+ph), color, 3)
                                 cv2.putText(frame, f"📱{label}", (px, py-10),
@@ -441,8 +365,8 @@ audio.terminate()
                         if self.calibration_count >= self.max_calibration_frames:
                             self.baseline_ratio = sum(self.calibration_frames) / len(self.calibration_frames)
                             self.is_calibrating = False
-                            print(f"✅ Calibration complete! Your baseline ratio: {self.baseline_ratio:.3f}")
-                            print(f"📊 Looking down threshold: {self.baseline_ratio + 0.15:.3f}")
+                            print(f"✅ Calibration complete! Baseline: {self.baseline_ratio:.3f}")
+                            print(f"📊 Triggers when ratio < {self.baseline_ratio - 0.04:.3f} (head tilt) or phone detected")
 
                     # Multi-modal detection
                     is_looking_down, detection_reason = self.detect_looking_down(avg_ratio, eye_state, self.phone_detected)
@@ -464,18 +388,10 @@ audio.terminate()
                     # Visual feedback (like original)
                     h, w = frame.shape[:2]
 
-                    # Draw eye regions (green rectangles like original)
-                    for eye_points in [left, right]:
-                        for point in eye_points:
-                            x = int(point.x * w)
-                            y = int(point.y * h)
-                            cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
-
-                    # Draw iris points
-                    for iris in [l_iris, r_iris]:
-                        x = int(iris.x * w)
-                        y = int(iris.y * h)
-                        cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
+                    # Draw head-tilt landmarks: eye centers (green) and nose (blue)
+                    for point in [left[0], right[0]]:
+                        cv2.circle(frame, (int(point.x * w), int(point.y * h)), 4, (0, 255, 0), -1)
+                    cv2.circle(frame, (int(l_iris.x * w), int(l_iris.y * h)), 4, (255, 100, 0), -1)
 
                     # Status display
                     if self.is_calibrating:
