@@ -17,7 +17,7 @@ audio = subprocess.Popen(
 
 cv2.namedWindow('GET BACK TO WORK', cv2.WINDOW_NORMAL)
 cv2.resizeWindow('GET BACK TO WORK', 480, 360)
-cv2.moveWindow('GET BACK TO WORK', 290, 160)
+cv2.moveWindow('GET BACK TO WORK', 300, 160)
 
 while cap.isOpened():
     ret, frame = cap.read()

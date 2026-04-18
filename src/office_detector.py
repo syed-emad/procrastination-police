@@ -32,7 +32,7 @@ class OfficeClipDetector:
         self.video_proc = None  # subprocess handle so we can kill it
         self.start_time = None
         self.last_clip_time = 0
-        self.clip_cooldown = 15.0  # seconds before next clip can trigger
+        self.clip_cooldown = 3.0  # seconds before next clip can trigger
 
         # Calibration for personalized thresholds
         self.calibration_frames = []
@@ -330,8 +330,7 @@ class OfficeClipDetector:
             return
 
         self.video_playing = False
-        self.start_time = None  # force timer to restart from scratch on next detection
-        self.last_clip_time = time.time() - self.clip_cooldown + 3  # 3s buffer before re-trigger
+        self.start_time = None
         print("📵 Phone gone — clip stopped!")
 
         # Kill the popup video window
@@ -392,8 +391,8 @@ class OfficeClipDetector:
                         hits = sum(self.phone_history)
                         history_len = len(self.phone_history)
 
-                        # Confirm PRESENT: any single detection is enough
-                        if hits >= 1:
+                        # Confirm PRESENT: need 2 of last 4 checks (avoids 1-frame flickers)
+                        if hits >= 2:
                             self.phone_confirmed = True
                         # Confirm GONE: 0 of last 3 checks saw phone (requires 3 consecutive misses)
                         elif history_len >= 3 and hits == 0:
